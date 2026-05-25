@@ -858,22 +858,37 @@ func main() {
 
 	// Connect to WhatsApp
 	if client.Store.ID == nil {
-		// No ID stored, this is a new client, need to pair with phone
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			logger.Errorf("Failed to connect: %v", err)
-			return
-		}
-
-		// Print QR code for pairing with phone
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				fmt.Println("\nScan this QR code with your WhatsApp app:")
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else if evt.Event == "success" {
-				connected <- true
-				break
+		// No ID stored, need to pair
+		phoneNumber := os.Getenv("WHATSAPP_PHONE")
+		if phoneNumber != "" {
+			// Phone-number pairing: generates an 8-char code the user types in WhatsApp
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
+			code, err := client.PairPhone(context.Background(), phoneNumber, true, whatsmeow.PairClientChrome, "Chrome (Linux)")
+			if err != nil {
+				logger.Errorf("Failed to get pairing code: %v", err)
+				return
+			}
+			fmt.Printf("\nPhone pairing code: %s\n", code)
+			fmt.Println("Enter this code in WhatsApp → Settings → Linked Devices → Link a Device → Link with phone number")
+		} else {
+			qrChan, _ := client.GetQRChannel(context.Background())
+			err = client.Connect()
+			if err != nil {
+				logger.Errorf("Failed to connect: %v", err)
+				return
+			}
+			fmt.Println("\nScan this QR code with your WhatsApp app:")
+			for evt := range qrChan {
+				if evt.Event == "code" {
+					qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+				} else if evt.Event == "success" {
+					connected <- true
+					break
+				}
 			}
 		}
 
@@ -882,7 +897,7 @@ func main() {
 		case <-connected:
 			fmt.Println("\nSuccessfully connected and authenticated!")
 		case <-time.After(3 * time.Minute):
-			logger.Errorf("Timeout waiting for QR code scan")
+			logger.Errorf("Timeout waiting for pairing")
 			return
 		}
 	} else {
@@ -973,7 +988,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 
 		// If we didn't get a name, try group info
 		if name == "" {
-			groupInfo, err := client.GetGroupInfo(jid)
+			groupInfo, err := client.GetGroupInfo(context.Background(), jid)
 			if err == nil && groupInfo.Name != "" {
 				name = groupInfo.Name
 			} else {
