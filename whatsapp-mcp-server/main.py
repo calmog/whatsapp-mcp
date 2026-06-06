@@ -12,7 +12,8 @@ from whatsapp import (
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
-    download_media as whatsapp_download_media
+    download_media as whatsapp_download_media,
+    request_history_sync as whatsapp_request_history_sync,
 )
 
 # Initialize FastMCP server
@@ -245,6 +246,27 @@ def download_media(message_id: str, chat_jid: str) -> Dict[str, Any]:
             "success": False,
             "message": "Failed to download media"
         }
+
+@mcp.tool()
+def request_history_sync(chat_jid: str) -> Dict[str, Any]:
+    """Request additional message history for a chat that exists in the local database.
+
+    Use this when a chat has fewer messages than expected. Requires the chat to already
+    have at least one message in the local DB (used as the sync anchor). WhatsApp's
+    multi-device API does not support fetching history for chats with no local messages
+    — for those, send a message to the contact first to create the chat entry.
+
+    Results arrive asynchronously — wait a few seconds then retry list_messages.
+
+    Args:
+        chat_jid: The JID of the chat to fetch more history for (e.g. "1234567890@s.whatsapp.net")
+
+    Returns:
+        A dictionary with success status and a status message.
+    """
+    success, message = whatsapp_request_history_sync(chat_jid)
+    return {"success": success, "message": message}
+
 
 if __name__ == "__main__":
     # Initialize and run the server
