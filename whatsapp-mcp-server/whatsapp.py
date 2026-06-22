@@ -58,6 +58,16 @@ def _digits(value: Optional[str]) -> str:
     return re.sub(r"\D", "", value or "")
 
 
+def _jid_user(jid: str) -> str:
+    """User part of a JID without the @server or any :device / .agent suffix.
+
+    A JID can carry a device/agent suffix (e.g. `<lid>:43@lid`, `<phone>.0@...`).
+    The lid map is keyed by the bare user id, so strip the suffix before any lookup.
+    """
+    user = jid.partition("@")[0]
+    return user.split(":", 1)[0].split(".", 1)[0]
+
+
 def _candidate_jids_for_phone(conn: sqlite3.Connection, phone: str, has_session: bool) -> List[str]:
     """Map a phone number to every chat JID it could be stored under.
 
@@ -80,11 +90,28 @@ def _candidate_jids_for_phone(conn: sqlite3.Connection, phone: str, has_session:
     return list(dict.fromkeys(candidates))
 
 
+def _jid_for_bare_number(conn: sqlite3.Connection, number: str, has_session: bool) -> str:
+    """Turn a bare sender id (no @, as stored in messages.sender) into its best JID.
+
+    A message sender is stored as a bare number that may be either a LID or a phone
+    number; consult the lid map to pick the right server suffix so name resolution can
+    find the contact. Falls back to the phone server when the map doesn't know it.
+    """
+    digits = _digits(number)
+    if has_session and digits:
+        if conn.execute("SELECT 1 FROM wa.whatsmeow_lid_map WHERE lid = ?", (digits,)).fetchone():
+            return f"{digits}@lid"
+        if conn.execute("SELECT 1 FROM wa.whatsmeow_lid_map WHERE pn = ?", (digits,)).fetchone():
+            return f"{digits}@s.whatsapp.net"
+    return f"{digits}@s.whatsapp.net" if digits else number
+
+
 def _alternate_jid(conn: sqlite3.Connection, jid: str, has_session: bool) -> Optional[str]:
     """Return the phone<->LID counterpart of a JID via the lid map, if known."""
     if not (has_session and jid):
         return None
-    user, _, server = jid.partition("@")
+    server = jid.partition("@")[2]
+    user = _jid_user(jid)
     if server == "lid":
         row = conn.execute("SELECT pn FROM wa.whatsmeow_lid_map WHERE lid = ?", (user,)).fetchone()
         if row and row[0]:
@@ -126,7 +153,8 @@ def _resolve_contact_name(conn: sqlite3.Connection, jid: str, has_session: bool,
 
 def _phone_for_jid(conn: sqlite3.Connection, jid: str, has_session: bool) -> str:
     """Best-effort phone number for a JID; resolves LID JIDs back to their phone number."""
-    user, _, server = jid.partition("@")
+    server = jid.partition("@")[2]
+    user = _jid_user(jid)
     if server == "lid" and has_session:
         row = conn.execute("SELECT pn FROM wa.whatsmeow_lid_map WHERE lid = ?", (user,)).fetchone()
         if row and row[0]:
@@ -135,8 +163,28 @@ def _phone_for_jid(conn: sqlite3.Connection, jid: str, has_session: bool) -> str
 
 
 def _needs_name_resolution(name: Optional[str], jid: str) -> bool:
-    """True when the stored chat name is missing or just the raw JID/LID number."""
-    return not name or name == jid.partition("@")[0]
+    """True when the stored chat name is missing or just a raw number.
+
+    Besides an empty name or the chat's own JID/LID digits, the bridge sometimes
+    stores an @lid chat's name as the *wrong* party's bare number (e.g. the owner's
+    own LID, taken from a from-me message). Any name with no letters at all is treated
+    as unresolved and sent through address-book resolution.
+    """
+    if not name:
+        return True
+    if name == jid.partition("@")[0]:
+        return True
+    return not any(ch.isalpha() for ch in name)
+
+
+def _ts(value: Optional[str]) -> Optional[datetime]:
+    """Parse a stored ISO timestamp, tolerating nulls/garbage (returns None)."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
 
 @dataclass
 class Message:
@@ -178,40 +226,29 @@ class MessageContext:
 def get_sender_name(sender_jid: str) -> str:
     try:
         conn = _connect_messages()
+        has_session = _attach_session(conn)
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
-            LIMIT 1
-        """, (sender_jid,))
-        
+
+        # The sender is usually a bare LID/phone number; map it to a proper JID and try
+        # the address book first, since the chats table can't name LID senders.
+        jid = sender_jid if '@' in sender_jid else _jid_for_bare_number(conn, sender_jid, has_session)
+        name = _resolve_contact_name(conn, jid, has_session)
+        if name and not _needs_name_resolution(name, jid):
+            return name
+
+        # Fall back to the chats table, but never return a bare-number chat name (the
+        # bridge stores the wrong party's number for @lid chats) — that's not a real name.
+        cursor.execute("SELECT name FROM chats WHERE jid = ? LIMIT 1", (jid,))
         result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
         if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
+            phone_part = sender_jid.split('@')[0] if '@' in sender_jid else sender_jid
+            cursor.execute("SELECT name FROM chats WHERE jid LIKE ? LIMIT 1", (f"%{phone_part}%",))
             result = cursor.fetchone()
-        
-        if result and result[0]:
+        if result and result[0] and not _needs_name_resolution(result[0], jid):
             return result[0]
-        else:
-            return sender_jid
-        
+
+        return name or sender_jid
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -219,12 +256,29 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def _display_chat_name(chat_jid: str, raw_name: Optional[str]) -> Optional[str]:
+    """Resolve a chat's display name, fixing the bare-number names the bridge stores
+    for @lid chats. Returns the raw name unchanged when it's already a real name."""
+    if not chat_jid or not _needs_name_resolution(raw_name, chat_jid):
+        return raw_name
+    try:
+        conn = _connect_messages()
+        has_session = _attach_session(conn)
+        return _resolve_contact_name(conn, chat_jid, has_session, fallback=raw_name)
+    except sqlite3.Error:
+        return raw_name
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
-    
-    if show_chat_info and message.chat_name:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
+
+    chat_name = _display_chat_name(message.chat_jid, message.chat_name)
+    if show_chat_info and chat_name:
+        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {chat_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
         
@@ -543,7 +597,6 @@ def search_contacts(query: str) -> List[Contact]:
         search_pattern = '%' + query + '%'
         # jid -> name, in insertion order (chats first, then address-book-only contacts).
         found: dict = {}
-        chat_jids = set()  # JIDs that have an actual synced chat (so lookups will work).
 
         # 1. Chats we've actually synced (covers groups-excluded direct chats).
         cursor.execute("""
@@ -556,7 +609,6 @@ def search_contacts(query: str) -> List[Contact]:
         """, (search_pattern, search_pattern))
         for jid, name in cursor.fetchall():
             found[jid] = name
-            chat_jids.add(jid)
 
         if has_session:
             # 2. The full address book — contacts you've never opened a chat with, and
@@ -598,10 +650,22 @@ def search_contacts(query: str) -> List[Contact]:
                         if name:
                             found[candidate] = name
 
-        # Resolve names/phones, then collapse the multiple JIDs a single person can have
-        # (phone JID + LID) into one entry, preferring the JID that has a synced chat so
-        # downstream message lookups actually return data.
+        # For each candidate JID, look up how recently its synced chat was active, so we
+        # can collapse the multiple JIDs a single person can have (phone JID + LID +
+        # device suffixes) into one entry, keeping the JID whose chat is the most recently
+        # active — i.e. the live LID chat over a stale phone-number chat — so downstream
+        # message lookups land on the current conversation.
+        chat_times: dict = {}
+        if found:
+            placeholders = ",".join("?" * len(found))
+            for jid, last_time in conn.execute(
+                f"SELECT jid, last_message_time FROM chats WHERE jid IN ({placeholders})",
+                list(found),
+            ).fetchall():
+                chat_times[jid] = _ts(last_time)
+
         by_phone: dict = {}
+        best_time: dict = {}
         order: List[str] = []
         for jid, name in found.items():
             if _needs_name_resolution(name, jid):
@@ -609,11 +673,14 @@ def search_contacts(query: str) -> List[Contact]:
             phone = _phone_for_jid(conn, jid, has_session)
             contact = Contact(phone_number=phone, name=name, jid=jid)
             key = phone or jid
+            incoming = chat_times.get(jid)
             if key not in by_phone:
                 by_phone[key] = contact
+                best_time[key] = incoming
                 order.append(key)
-            elif jid in chat_jids and by_phone[key].jid not in chat_jids:
-                by_phone[key] = contact  # prefer the JID that actually has messages
+            elif incoming and (best_time[key] is None or incoming > best_time[key]):
+                by_phone[key] = contact  # a more recently active chat wins
+                best_time[key] = incoming
 
         return [by_phone[key] for key in order][:50]
 
