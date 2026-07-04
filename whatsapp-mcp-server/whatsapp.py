@@ -1,5 +1,6 @@
 import sqlite3
 import re
+import sys
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -27,9 +28,41 @@ _SYNC_HINT = (
 # bridge's brief write locks rather than erroring out immediately.
 _DB_BUSY_TIMEOUT_MS = 5000
 
+# (connect timeout, read timeout) for the bridge REST API. Sends and syncs can be slow;
+# media downloads slower still. Without these, a wedged bridge hangs the MCP call forever.
+_HTTP_TIMEOUT = (5, 60)
+_HTTP_MEDIA_TIMEOUT = (5, 180)
+
+# Self-heal entry point for a stale/hung bridge (safe to run any time — it only restarts
+# the launchd bridge when DM traffic looks stale).
+_WATCHDOG_SCRIPT = os.path.expanduser("~/.claude/scripts/whatsapp-bridge-watchdog.sh")
+
+_BRIDGE_DOWN_HINT = (
+    "Could not reach the WhatsApp bridge REST API on localhost:8080. The Go bridge is down, "
+    "still starting, or a stale instance holds the port (the bridge can look alive while its "
+    "REST goroutine is dead). Check `pgrep -fl whatsapp-bridge` and `lsof -iTCP:8080 -sTCP:LISTEN` "
+    f"(keep exactly one bridge), or run `bash {_WATCHDOG_SCRIPT}` to self-heal a stale bridge, "
+    "then retry."
+)
+
+
+def _db_error_message(e: Exception) -> str:
+    """A user-actionable message for SQLite failures (locked / missing / corrupt DB)."""
+    return (
+        f"WhatsApp database error: {e}. The store under whatsapp-bridge/store/ is written by the "
+        "Go bridge; if the DB is missing or persistently locked, the bridge may be down or wedged "
+        f"— check `pgrep -fl whatsapp-bridge` or run `bash {_WATCHDOG_SCRIPT}` (restarts the "
+        "launchd bridge when DMs are stale), then retry."
+    )
+
 
 def _connect_messages() -> sqlite3.Connection:
     """Open messages.db read-only with a busy timeout (the bridge is the only writer)."""
+    if not os.path.exists(MESSAGES_DB_PATH):
+        raise RuntimeError(
+            f"messages.db not found at {MESSAGES_DB_PATH} — the Go bridge has never run here, or the "
+            f"store moved. Check the bridge: `pgrep -fl whatsapp-bridge`, `bash {_WATCHDOG_SCRIPT}`."
+        )
     conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True, timeout=_DB_BUSY_TIMEOUT_MS / 1000)
     conn.execute(f"PRAGMA busy_timeout = {_DB_BUSY_TIMEOUT_MS}")
     return conn
@@ -186,6 +219,162 @@ def _ts(value: Optional[str]) -> Optional[datetime]:
     except (ValueError, TypeError):
         return None
 
+
+def _age_hours(value: Optional[str]) -> Optional[float]:
+    """Hours elapsed since a stored timestamp (tz-aware; naive values assumed local)."""
+    ts = _ts(value)
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.astimezone()  # naive -> assume local time
+    return (datetime.now().astimezone() - ts).total_seconds() / 3600
+
+
+def _own_ids(conn: sqlite3.Connection, has_session: bool) -> Tuple[Optional[str], Optional[str]]:
+    """The account owner's bare (phone, lid) from whatsmeow's device table.
+
+    Used to exclude the self-chat from open-loop scans and to never mistake the owner's
+    own LID (which the bridge historically wrote as many @lid chats' names) for a contact.
+    """
+    if not has_session:
+        return None, None
+    try:
+        row = conn.execute("SELECT jid, lid FROM wa.whatsmeow_device LIMIT 1").fetchone()
+    except sqlite3.Error:
+        return None, None
+    if not row:
+        return None, None
+    return (_jid_user(row[0] or "") or None, _jid_user(row[1] or "") or None)
+
+
+def _contact_record(conn: sqlite3.Connection, has_session: bool,
+                    phone: Optional[str] = None, lid: Optional[str] = None) -> dict:
+    """Build the full identity record for one person from either side of the lid map.
+
+    Fills in the missing phone/lid half via whatsmeow_lid_map, resolves the display name
+    from the address book, and checks which of the two possible chat JIDs actually exist
+    in messages.db — `live_jid` is the one to use for reading/sending (the most recently
+    active existing chat, else the LID JID, else the phone JID).
+    """
+    phone = _digits(phone) or None
+    lid = _digits(lid) or None
+    if has_session:
+        if phone and not lid:
+            row = conn.execute("SELECT lid FROM wa.whatsmeow_lid_map WHERE pn = ?", (phone,)).fetchone()
+            lid = row[0] if row and row[0] else None
+        elif lid and not phone:
+            row = conn.execute("SELECT pn FROM wa.whatsmeow_lid_map WHERE lid = ?", (lid,)).fetchone()
+            phone = row[0] if row and row[0] else None
+    phone_jid = f"{phone}@s.whatsapp.net" if phone else None
+    lid_jid = f"{lid}@lid" if lid else None
+
+    chats: dict = {}  # jid -> (name, last_message_time)
+    for jid in (phone_jid, lid_jid):
+        if not jid:
+            continue
+        row = conn.execute("SELECT name, last_message_time FROM chats WHERE jid = ?", (jid,)).fetchone()
+        if row:
+            chats[jid] = row
+    if chats:
+        # ISO strings with a uniform format compare correctly as strings.
+        live_jid = max(chats, key=lambda j: chats[j][1] or "")
+    else:
+        live_jid = lid_jid or phone_jid
+
+    name = _resolve_contact_name(conn, live_jid, has_session) if live_jid else None
+    if _needs_name_resolution(name, live_jid or ""):
+        # Address book had nothing usable; fall back to a real (lettered) chat name.
+        for jid, (chat_name, _t) in chats.items():
+            if chat_name and not _needs_name_resolution(chat_name, jid):
+                name = chat_name
+                break
+
+    return {
+        "name": name,
+        "phone": phone,
+        "lid": lid,
+        "phone_jid": phone_jid,
+        "lid_jid": lid_jid,
+        "live_jid": live_jid,
+        "chat_found": bool(chats),
+        "chat_last_active": chats[live_jid][1] if live_jid in chats else None,
+    }
+
+
+def _find_contact_records(conn: sqlite3.Connection, has_session: bool, query: str) -> List[dict]:
+    """Shared lookup behind resolve_contact / open_loops: name or number -> person records.
+
+    Numeric queries go through the lid map (exact pn/lid, then pn suffix for a number
+    missing its country code). Name queries scan the address book and chat names.
+    Results are de-duplicated per person and sorted by chat recency (live chats first).
+    """
+    query = query.strip()
+    digits = _digits(query)
+    looks_numeric = bool(digits) and not any(ch.isalpha() for ch in query)
+
+    seen: set = set()
+    records: List[dict] = []
+
+    def add(phone: Optional[str] = None, lid: Optional[str] = None) -> None:
+        rec = _contact_record(conn, has_session, phone=phone, lid=lid)
+        key = rec["phone"] or rec["lid"]
+        if key and key not in seen:
+            seen.add(key)
+            records.append(rec)
+
+    if looks_numeric:
+        if has_session:
+            row = conn.execute(
+                "SELECT lid, pn FROM wa.whatsmeow_lid_map WHERE pn = ? OR lid = ?",
+                (digits, digits),
+            ).fetchone()
+            if row:
+                add(phone=row[1], lid=row[0])
+            elif len(digits) >= 7:
+                # Tolerate a number given without its country code: suffix match.
+                for lid, pn in conn.execute(
+                    "SELECT lid, pn FROM wa.whatsmeow_lid_map WHERE pn LIKE ? LIMIT 10",
+                    (f"%{digits}",),
+                ).fetchall():
+                    add(phone=pn, lid=lid)
+        if not records:
+            # No lid-map row — the person may still have a plain phone-JID chat.
+            add(phone=digits)
+    else:
+        pattern = f"%{query}%"
+        if has_session:
+            rows = conn.execute(
+                """
+                SELECT their_jid FROM wa.whatsmeow_contacts
+                WHERE their_jid NOT LIKE '%@g.us'
+                    AND (LOWER(full_name) LIKE LOWER(?) OR LOWER(first_name) LIKE LOWER(?)
+                         OR LOWER(push_name) LIKE LOWER(?) OR LOWER(business_name) LIKE LOWER(?))
+                LIMIT 30
+                """,
+                (pattern, pattern, pattern, pattern),
+            ).fetchall()
+            for (their_jid,) in rows:
+                user = _jid_user(their_jid)
+                if their_jid.endswith("@lid"):
+                    add(lid=user)
+                else:
+                    add(phone=user)
+        # Chats named directly (covers people missing from the address book).
+        for jid, _name in conn.execute(
+            "SELECT jid, name FROM chats WHERE LOWER(name) LIKE LOWER(?) AND jid NOT LIKE '%@g.us' LIMIT 20",
+            (pattern,),
+        ).fetchall():
+            user = _jid_user(jid)
+            if jid.endswith("@lid"):
+                add(lid=user)
+            elif jid.endswith("@s.whatsapp.net"):
+                add(phone=user)
+
+    # Most recently active chats first; contacts with no synced chat sink to the bottom.
+    records.sort(key=lambda r: r["chat_last_active"] or "", reverse=True)
+    return records
+
+
 @dataclass
 class Message:
     timestamp: datetime
@@ -250,7 +439,7 @@ def get_sender_name(sender_jid: str) -> str:
         return name or sender_jid
 
     except sqlite3.Error as e:
-        print(f"Database error while getting sender name: {e}")
+        print(f"Database error while getting sender name: {e}", file=sys.stderr)
         return sender_jid
     finally:
         if 'conn' in locals():
@@ -290,7 +479,7 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
-        print(f"Error formatting message: {e}")
+        print(f"Error formatting message: {e}", file=sys.stderr)
     return output
 
 def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:
@@ -318,8 +507,9 @@ def list_messages(
     """Get messages matching the specified criteria with optional context."""
     try:
         conn = _connect_messages()
+        has_session = _attach_session(conn)
         cursor = conn.cursor()
-        
+
         # Build base query
         query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
@@ -346,13 +536,35 @@ def list_messages(
             params.append(before)
 
         if sender_phone_number:
-            where_clauses.append("messages.sender = ?")
-            params.append(sender_phone_number)
-            
+            # messages.sender stores a bare number that may be a phone OR a LID, and the
+            # two are unrelated digit strings — match the caller's value plus its
+            # lid-map counterparts so a phone number finds LID-attributed messages.
+            digits = _digits(sender_phone_number)
+            sender_ids = [sender_phone_number, digits] if digits else [sender_phone_number]
+            if has_session and digits:
+                for a, b in (("lid", "pn"), ("pn", "lid")):
+                    row = conn.execute(
+                        f"SELECT {a} FROM wa.whatsmeow_lid_map WHERE {b} = ?", (digits,)
+                    ).fetchone()
+                    if row and row[0]:
+                        sender_ids.append(row[0])
+            sender_ids = list(dict.fromkeys(sender_ids))
+            where_clauses.append(f"messages.sender IN ({','.join('?' * len(sender_ids))})")
+            params.extend(sender_ids)
+
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
-            
+            # A person's chat may be keyed by their phone JID or (post-migration) an
+            # unrelated @lid JID — query all candidates so callers stop landing on the
+            # frozen @s.whatsapp.net chat. Group JIDs pass through untouched.
+            if chat_jid.endswith("@g.us") or not has_session:
+                chat_jids = [chat_jid]
+            else:
+                chat_jids = list(dict.fromkeys(
+                    [chat_jid] + _candidate_jids_for_phone(conn, _digits(chat_jid), has_session)
+                ))
+            where_clauses.append(f"messages.chat_jid IN ({','.join('?' * len(chat_jids))})")
+            params.extend(chat_jids)
+
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
             params.append(f"%{query}%")
@@ -398,10 +610,9 @@ def list_messages(
         if not result and chat_jid:
             return _SYNC_HINT
         return format_messages_list(result, show_chat_info=True)
-        
+
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
@@ -491,10 +702,9 @@ def get_message_context(
             before=before_messages,
             after=after_messages
         )
-        
+
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        raise
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
@@ -571,8 +781,7 @@ def list_chats(
         return result
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
@@ -685,16 +894,32 @@ def search_contacts(query: str) -> List[Contact]:
         return [by_phone[key] for key in order][:50]
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
 
 
+def _contact_match_ids(conn: sqlite3.Connection, jid: str, has_session: bool) -> Tuple[List[str], List[str]]:
+    """Every (chat JID, bare sender id) a contact could appear under.
+
+    The same person can appear as `<phone>@s.whatsapp.net`, `<lid>@lid`, or as a bare
+    phone/LID digit string in messages.sender — enumerate all of them via the lid map
+    so contact-scoped queries see both sides of the @lid migration.
+    """
+    if jid.endswith("@g.us"):
+        return [jid], [_jid_user(jid)]
+    chat_jids = list(dict.fromkeys([jid] + _candidate_jids_for_phone(conn, _digits(jid), has_session)))
+    sender_ids = list(dict.fromkeys([_jid_user(c) for c in chat_jids] + [jid]))
+    return chat_jids, sender_ids
+
+
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """Get all chats involving the contact.
-    
+
+    Matches the contact under every identity the lid map knows for them (phone JID,
+    LID JID, bare sender ids), so LID-keyed chats and group messages are found.
+
     Args:
         jid: The contact's JID to search for
         limit: Maximum number of chats to return (default 20)
@@ -702,10 +927,16 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
     """
     try:
         conn = _connect_messages()
+        has_session = _attach_session(conn)
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT DISTINCT
+
+        chat_jids, sender_ids = _contact_match_ids(conn, jid, has_session)
+        jid_ph = ",".join("?" * len(chat_jids))
+        snd_ph = ",".join("?" * len(sender_ids))
+        # One row per chat (the old JOIN emitted one row per matching *message*), with
+        # the chat's actual last message attached via the last_message_time join.
+        cursor.execute(f"""
+            SELECT
                 c.jid,
                 c.name,
                 c.last_message_time,
@@ -713,44 +944,55 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 m.sender as last_sender,
                 m.is_from_me as last_is_from_me
             FROM chats c
-            JOIN messages m ON c.jid = m.chat_jid
-            WHERE m.sender = ? OR c.jid = ?
+            LEFT JOIN messages m ON c.jid = m.chat_jid
+                AND c.last_message_time = m.timestamp
+            WHERE c.jid IN ({jid_ph})
+               OR EXISTS (SELECT 1 FROM messages mm
+                          WHERE mm.chat_jid = c.jid AND mm.sender IN ({snd_ph}))
+            GROUP BY c.jid
             ORDER BY c.last_message_time DESC
             LIMIT ? OFFSET ?
-        """, (jid, jid, limit, page * limit))
-        
+        """, (*chat_jids, *sender_ids, limit, page * limit))
+
         chats = cursor.fetchall()
-        
+
         result = []
         for chat_data in chats:
+            name = chat_data[1]
+            if _needs_name_resolution(name, chat_data[0]):
+                name = _resolve_contact_name(conn, chat_data[0], has_session, fallback=name)
             chat = Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=name,
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
-            
+
         return result
-        
+
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return []
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
 
 
 def get_last_interaction(jid: str) -> str:
-    """Get most recent message involving the contact."""
+    """Get most recent message involving the contact (lid-aware: checks the contact's
+    phone JID, LID JID, and bare sender ids so the live @lid chat is included)."""
     try:
         conn = _connect_messages()
+        has_session = _attach_session(conn)
         cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT 
+
+        chat_jids, sender_ids = _contact_match_ids(conn, jid, has_session)
+        jid_ph = ",".join("?" * len(chat_jids))
+        snd_ph = ",".join("?" * len(sender_ids))
+        cursor.execute(f"""
+            SELECT
                 m.timestamp,
                 m.sender,
                 c.name,
@@ -761,16 +1003,16 @@ def get_last_interaction(jid: str) -> str:
                 m.media_type
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
-            WHERE m.sender = ? OR c.jid = ?
+            WHERE m.sender IN ({snd_ph}) OR c.jid IN ({jid_ph})
             ORDER BY m.timestamp DESC
             LIMIT 1
-        """, (jid, jid))
-        
+        """, (*sender_ids, *chat_jids))
+
         msg_data = cursor.fetchone()
-        
+
         if not msg_data:
             return None
-            
+
         message = Message(
             timestamp=datetime.fromisoformat(msg_data[0]),
             sender=msg_data[1],
@@ -781,12 +1023,11 @@ def get_last_interaction(jid: str) -> str:
             id=msg_data[6],
             media_type=msg_data[7]
         )
-        
+
         return format_message(message)
-        
+
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
@@ -849,8 +1090,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
         )
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
@@ -916,20 +1156,230 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
         )
 
     except sqlite3.Error as e:
-        print(f"Database error: {e}")
-        return None
+        raise RuntimeError(_db_error_message(e)) from e
     finally:
         if 'conn' in locals():
             conn.close()
 
+def resolve_contact(query: str) -> dict:
+    """Resolve a contact name / phone number / LID to the person's live chat JID.
+
+    First-class replacement for the manual recipe
+    `sqlite3 .../store/whatsapp.db "SELECT lid FROM whatsmeow_lid_map WHERE pn='<phone>';"`.
+
+    Returns a dict with `status`:
+      - "found": one match -> `contact` record with phone, lid, phone_jid, lid_jid,
+        live_jid (the JID to use), chat_found, chat_last_active.
+      - "multiple_matches": several people matched -> `contacts` candidates (pick one).
+      - "not_found" / "error": nothing matched, or lookups are impossible.
+    """
+    if not query or not query.strip():
+        return {"status": "error", "message": "Provide a contact name, phone number, or LID."}
+    try:
+        conn = _connect_messages()
+        has_session = _attach_session(conn)
+        if not has_session:
+            return {
+                "status": "error",
+                "message": (
+                    "whatsapp.db (whatsmeow's session store) is unavailable, so phone<->LID "
+                    "resolution is impossible right now. " + _db_error_message(Exception("session DB not attached"))
+                ),
+            }
+        records = _find_contact_records(conn, has_session, query)
+
+        # Never resolve to the account owner by accident (the owner's own LID is a
+        # historically common junk value in @lid chat names).
+        own_phone, own_lid = _own_ids(conn, has_session)
+        records = [r for r in records if r["phone"] != own_phone and r["lid"] != own_lid] or records
+
+        if not records:
+            return {
+                "status": "not_found",
+                "query": query,
+                "message": (
+                    "No contact matched. Try another spelling, the person's push name, or the full "
+                    "international phone number (digits only). If you know the phone, the raw fallback is: "
+                    "sqlite3 whatsapp-bridge/store/whatsapp.db "
+                    "\"SELECT lid FROM whatsmeow_lid_map WHERE pn='<phone>';\" -> use '<lid>@lid'."
+                ),
+            }
+        if len(records) == 1:
+            return {"status": "found", "query": query, "contact": records[0]}
+        return {
+            "status": "multiple_matches",
+            "query": query,
+            "message": "Multiple contacts matched — pick the right person and use their live_jid.",
+            "contacts": records[:10],
+        }
+    except sqlite3.Error as e:
+        raise RuntimeError(_db_error_message(e)) from e
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def _resolve_chat_target(conn: sqlite3.Connection, has_session: bool, item: str) -> Tuple[Optional[str], Optional[str]]:
+    """Map one open_loops target (JID / phone / LID / name) to a chat JID.
+
+    Returns (chat_jid, note). chat_jid is None when the item can't be resolved to a
+    synced chat; note carries a human-readable explanation for the report.
+    """
+    item = (item or "").strip()
+    if not item:
+        return None, None
+    if "@" in item:
+        if item.endswith("@g.us") or not has_session:
+            return item, None
+        # Map a phone-JID to its live @lid counterpart (or vice versa) if that chat
+        # is more recent — the phone-keyed chat froze at the @lid migration.
+        rec = _contact_record(
+            conn, has_session,
+            phone=_jid_user(item) if not item.endswith("@lid") else None,
+            lid=_jid_user(item) if item.endswith("@lid") else None,
+        )
+        if rec["chat_found"]:
+            return rec["live_jid"], None
+        return item, None
+    records = _find_contact_records(conn, has_session, item)
+    records = [r for r in records if r["chat_found"]]
+    if not records:
+        return None, f"'{item}': no matching contact with a synced chat"
+    note = None
+    if len(records) > 1:
+        note = (f"'{item}' matched {len(records)} contacts; using the most recently active: "
+                f"{records[0]['name'] or records[0]['live_jid']}")
+    return records[0]["live_jid"], note
+
+
+def open_loops(
+    chats: Optional[List[str]] = None,
+    hours: float = 12.0,
+    max_chats: int = 30,
+    context_messages: int = 4,
+    include_groups: bool = False,
+) -> str:
+    """Find conversations with an open loop, for the morning sweep's key-people check.
+
+    A chat is an open loop when:
+      - them-last: the last message is incoming (unanswered by Me), any age; or
+      - me-last: the last message is from Me and older than `hours` — I may be awaiting
+        their reply or owing a follow-up (asks buried mid-thread get missed by
+        snippet-only list_chats sweeps; this catches them at the chat level).
+
+    `chats` may mix JIDs, phone numbers, LIDs, and contact names; default is the
+    `max_chats` most recently active DM chats (including @lid), excluding the self-chat.
+    Returns a formatted report with the last `context_messages` messages per open loop.
+    """
+    try:
+        conn = _connect_messages()
+        has_session = _attach_session(conn)
+        own_phone, own_lid = _own_ids(conn, has_session)
+        own_jids = {j for j in (f"{own_phone}@s.whatsapp.net" if own_phone else None,
+                                f"{own_lid}@lid" if own_lid else None) if j}
+
+        notes: List[str] = []
+        target_jids: List[str] = []
+        if chats:
+            for item in chats:
+                jid, note = _resolve_chat_target(conn, has_session, item)
+                if note:
+                    notes.append(note)
+                if jid and jid not in target_jids:
+                    target_jids.append(jid)
+        else:
+            filters = ["jid NOT LIKE '%@newsletter'", "jid != 'status@broadcast'",
+                       "last_message_time IS NOT NULL"]
+            if not include_groups:
+                filters.append("jid NOT LIKE '%@g.us'")
+            rows = conn.execute(
+                f"SELECT jid FROM chats WHERE {' AND '.join(filters)} "
+                "ORDER BY last_message_time DESC LIMIT ?",
+                (max_chats * 2 + 10,),
+            ).fetchall()
+            # Collapse a person's phone-JID + LID chats into one (recency order means
+            # the first JID seen per person is their live chat), and skip the self-chat.
+            seen_people: set = set()
+            for (jid,) in rows:
+                if jid in own_jids:
+                    continue
+                person = _phone_for_jid(conn, jid, has_session)
+                if person in (own_phone, own_lid) or person in seen_people:
+                    continue
+                seen_people.add(person)
+                target_jids.append(jid)
+                if len(target_jids) >= max_chats:
+                    break
+
+        loops: List[str] = []
+        n_context = max(int(context_messages), 1)
+        for jid in target_jids:
+            rows = conn.execute(
+                """
+                SELECT timestamp, sender, content, is_from_me, media_type
+                FROM messages WHERE chat_jid = ?
+                ORDER BY timestamp DESC LIMIT ?
+                """,
+                (jid, n_context),
+            ).fetchall()
+            if not rows:
+                continue
+            age_h = _age_hours(rows[0][0])
+            if age_h is None:
+                continue
+            last_from_me = bool(rows[0][3])
+            if last_from_me and age_h < hours:
+                continue  # I spoke last, recently — nothing owed yet
+            if last_from_me:
+                status = (f"me-last: I sent the last message {age_h:.1f}h ago with no reply since — "
+                          "awaiting their answer or owing a follow-up")
+            else:
+                status = f"them-last: their message has been UNANSWERED for {age_h:.1f}h"
+
+            raw_name = conn.execute("SELECT name FROM chats WHERE jid = ?", (jid,)).fetchone()
+            name = raw_name[0] if raw_name else None
+            if _needs_name_resolution(name, jid):
+                name = _resolve_contact_name(conn, jid, has_session, fallback=name)
+
+            lines = [f"{name or jid} — {jid}", f"  {status}"]
+            for ts_str, sender, content, is_from_me, media_type in reversed(rows):
+                if is_from_me:
+                    who = "Me"
+                else:
+                    sender_jid = _jid_for_bare_number(conn, sender or "", has_session)
+                    who = _resolve_contact_name(conn, sender_jid, has_session) or sender or "?"
+                body = content or (f"[{media_type}]" if media_type else "[no text]")
+                lines.append(f"    [{(ts_str or '')[:16]}] {who}: {body}")
+            loops.append("\n".join(lines))
+
+        checked = len(target_jids)
+        if loops:
+            report = (f"Open loops: {len(loops)} of {checked} chats checked "
+                      f"(me-last threshold {hours:g}h):\n\n" + "\n\n".join(loops))
+        else:
+            report = f"No open loops across {checked} chats checked (me-last threshold {hours:g}h)."
+        if notes:
+            report += "\n\nNotes:\n" + "\n".join(f"- {n}" for n in notes)
+        return report
+
+    except sqlite3.Error as e:
+        raise RuntimeError(_db_error_message(e)) from e
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
 def request_history_sync(chat_jid: str) -> Tuple[bool, str]:
     """Request additional history for a chat that exists in the local database."""
     try:
-        response = requests.post(f"{WHATSAPP_API_BASE_URL}/sync", json={"chat_jid": chat_jid})
+        response = requests.post(f"{WHATSAPP_API_BASE_URL}/sync", json={"chat_jid": chat_jid},
+                                 timeout=_HTTP_TIMEOUT)
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         return False, f"Error: HTTP {response.status_code} - {response.text}"
+    except requests.exceptions.ConnectionError:
+        return False, _BRIDGE_DOWN_HINT
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
 
@@ -945,16 +1395,18 @@ def send_message(recipient: str, message: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "message": message,
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        response = requests.post(url, json=payload, timeout=_HTTP_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
+    except requests.exceptions.ConnectionError:
+        return False, _BRIDGE_DOWN_HINT
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -979,16 +1431,18 @@ def send_file(recipient: str, media_path: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        response = requests.post(url, json=payload, timeout=_HTTP_MEDIA_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
+    except requests.exceptions.ConnectionError:
+        return False, _BRIDGE_DOWN_HINT
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -1019,16 +1473,18 @@ def send_audio_message(recipient: str, media_path: str) -> Tuple[bool, str]:
             "recipient": recipient,
             "media_path": media_path
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        response = requests.post(url, json=payload, timeout=_HTTP_MEDIA_TIMEOUT)
+
         # Check if the request was successful
         if response.status_code == 200:
             result = response.json()
             return result.get("success", False), result.get("message", "Unknown response")
         else:
             return False, f"Error: HTTP {response.status_code} - {response.text}"
-            
+
+    except requests.exceptions.ConnectionError:
+        return False, _BRIDGE_DOWN_HINT
     except requests.RequestException as e:
         return False, f"Request error: {str(e)}"
     except json.JSONDecodeError:
@@ -1052,28 +1508,31 @@ def download_media(message_id: str, chat_jid: str) -> Optional[str]:
             "message_id": message_id,
             "chat_jid": chat_jid
         }
-        
-        response = requests.post(url, json=payload)
-        
+
+        response = requests.post(url, json=payload, timeout=_HTTP_MEDIA_TIMEOUT)
+
         if response.status_code == 200:
             result = response.json()
             if result.get("success", False):
                 path = result.get("path")
-                print(f"Media downloaded successfully: {path}")
+                print(f"Media downloaded successfully: {path}", file=sys.stderr)
                 return path
             else:
-                print(f"Download failed: {result.get('message', 'Unknown error')}")
+                print(f"Download failed: {result.get('message', 'Unknown error')}", file=sys.stderr)
                 return None
         else:
-            print(f"Error: HTTP {response.status_code} - {response.text}")
+            print(f"Error: HTTP {response.status_code} - {response.text}", file=sys.stderr)
             return None
-            
+
+    except requests.exceptions.ConnectionError:
+        print(_BRIDGE_DOWN_HINT, file=sys.stderr)
+        return None
     except requests.RequestException as e:
-        print(f"Request error: {str(e)}")
+        print(f"Request error: {str(e)}", file=sys.stderr)
         return None
     except json.JSONDecodeError:
-        print(f"Error parsing response: {response.text}")
+        print(f"Error parsing response: {response.text}", file=sys.stderr)
         return None
     except Exception as e:
-        print(f"Unexpected error: {str(e)}")
+        print(f"Unexpected error: {str(e)}", file=sys.stderr)
         return None

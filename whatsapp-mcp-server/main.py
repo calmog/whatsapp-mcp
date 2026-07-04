@@ -9,6 +9,8 @@ from whatsapp import (
     get_contact_chats as whatsapp_get_contact_chats,
     get_last_interaction as whatsapp_get_last_interaction,
     get_message_context as whatsapp_get_message_context,
+    resolve_contact as whatsapp_resolve_contact,
+    open_loops as whatsapp_open_loops,
     send_message as whatsapp_send_message,
     send_file as whatsapp_send_file,
     send_audio_message as whatsapp_audio_voice_message,
@@ -154,6 +156,63 @@ def get_message_context(
     """
     context = whatsapp_get_message_context(message_id, before, after)
     return context
+
+@mcp.tool()
+def resolve_contact(query: str) -> Dict[str, Any]:
+    """Resolve a contact name, phone number, or LID to the person's LIVE WhatsApp chat JID.
+
+    WhatsApp migrated 1:1 chats to @lid JIDs whose digits are UNRELATED to the phone
+    number, so a phone-based JID often points at a frozen, stale chat. Call this FIRST
+    whenever you have a person's name or phone and need the JID for list_messages /
+    send_message / open_loops. Supersedes the manual sqlite whatsmeow_lid_map recipe.
+
+    Args:
+        query: Contact name (any language), phone number (with or without country code),
+               or a bare LID digit string.
+
+    Returns:
+        status "found" with a `contact` record — use its `live_jid` (also includes
+        phone, lid, phone_jid, lid_jid, chat_found, chat_last_active) — or
+        status "multiple_matches" with `contacts` candidates, or "not_found"/"error".
+    """
+    return whatsapp_resolve_contact(query)
+
+@mcp.tool()
+def open_loops(
+    chats: Optional[List[str]] = None,
+    hours: float = 12.0,
+    max_chats: int = 30,
+    context_messages: int = 4,
+    include_groups: bool = False
+) -> str:
+    """Find WhatsApp conversations with an open loop — built for the morning sweep's
+    key-people check, catching what a top-N snippet scan misses.
+
+    Flags a chat when:
+    - them-last: the last message is incoming, i.e. unanswered by Me (any age); or
+    - me-last: the last message is from Me and older than `hours` — awaiting their
+      reply or owing a follow-up.
+
+    Args:
+        chats: Optional targets — mix of chat JIDs, phone numbers, LIDs, or contact
+               names (e.g. the key-people list). Default: the most recently active
+               `max_chats` DM chats (including @lid), self-chat excluded.
+        hours: Age threshold for me-last loops (default 12).
+        max_chats: How many recent DM chats to scan in default mode (default 30).
+        context_messages: Last messages included per flagged chat (default 4).
+        include_groups: Also scan group chats in default mode (default False).
+
+    Returns:
+        A formatted report: per open loop, the chat name/JID, loop type + age, and the
+        last few messages; plus notes for targets that could not be resolved.
+    """
+    return whatsapp_open_loops(
+        chats=chats,
+        hours=hours,
+        max_chats=max_chats,
+        context_messages=context_messages,
+        include_groups=include_groups
+    )
 
 @mcp.tool()
 def send_message(
