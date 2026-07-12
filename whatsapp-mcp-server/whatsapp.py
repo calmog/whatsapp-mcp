@@ -33,16 +33,20 @@ _DB_BUSY_TIMEOUT_MS = 5000
 _HTTP_TIMEOUT = (5, 60)
 _HTTP_MEDIA_TIMEOUT = (5, 180)
 
-# Self-heal entry point for a stale/hung bridge (safe to run any time — it only restarts
-# the launchd bridge when DM traffic looks stale).
+# Optional self-heal entry point for a stale/hung bridge (safe to run any time — it only
+# restarts the launchd bridge when DM traffic looks stale). This is a personal helper that
+# is not shipped with the repo, so only mention it in error hints when it's actually present.
 _WATCHDOG_SCRIPT = os.path.expanduser("~/.claude/scripts/whatsapp-bridge-watchdog.sh")
+_WATCHDOG_HINT = (
+    f" or run `bash {_WATCHDOG_SCRIPT}` to self-heal a stale bridge"
+    if os.path.exists(_WATCHDOG_SCRIPT) else ""
+)
 
 _BRIDGE_DOWN_HINT = (
     "Could not reach the WhatsApp bridge REST API on localhost:8080. The Go bridge is down, "
     "still starting, or a stale instance holds the port (the bridge can look alive while its "
     "REST goroutine is dead). Check `pgrep -fl whatsapp-bridge` and `lsof -iTCP:8080 -sTCP:LISTEN` "
-    f"(keep exactly one bridge), or run `bash {_WATCHDOG_SCRIPT}` to self-heal a stale bridge, "
-    "then retry."
+    f"(keep exactly one bridge){_WATCHDOG_HINT}, then retry."
 )
 
 
@@ -51,8 +55,7 @@ def _db_error_message(e: Exception) -> str:
     return (
         f"WhatsApp database error: {e}. The store under whatsapp-bridge/store/ is written by the "
         "Go bridge; if the DB is missing or persistently locked, the bridge may be down or wedged "
-        f"— check `pgrep -fl whatsapp-bridge` or run `bash {_WATCHDOG_SCRIPT}` (restarts the "
-        "launchd bridge when DMs are stale), then retry."
+        f"— check `pgrep -fl whatsapp-bridge`{_WATCHDOG_HINT}, then retry."
     )
 
 
@@ -61,7 +64,7 @@ def _connect_messages() -> sqlite3.Connection:
     if not os.path.exists(MESSAGES_DB_PATH):
         raise RuntimeError(
             f"messages.db not found at {MESSAGES_DB_PATH} — the Go bridge has never run here, or the "
-            f"store moved. Check the bridge: `pgrep -fl whatsapp-bridge`, `bash {_WATCHDOG_SCRIPT}`."
+            f"store moved. Check the bridge: `pgrep -fl whatsapp-bridge`{_WATCHDOG_HINT}."
         )
     conn = sqlite3.connect(f"file:{MESSAGES_DB_PATH}?mode=ro", uri=True, timeout=_DB_BUSY_TIMEOUT_MS / 1000)
     conn.execute(f"PRAGMA busy_timeout = {_DB_BUSY_TIMEOUT_MS}")
