@@ -14,6 +14,17 @@ Here's an example of what you can do when it's connected to Claude.
 
 > *Caution:* as with many MCP servers, the WhatsApp MCP is subject to [the lethal trifecta](https://simonwillison.net/2025/Jun/16/the-lethal-trifecta/). This means that project injection could lead to private data exfiltration.
 
+## About this fork
+
+This is a fork of [lharries/whatsapp-mcp](https://github.com/lharries/whatsapp-mcp) that fixes contact-name resolution after WhatsApp's LID migration. On upstream, chats with `@lid` JIDs show a raw number instead of the contact's name, the same person shows up as two separate chats (one phone JID, one LID), and name or number lookups miss LID-keyed chats.
+
+The fix runs in the Python MCP layer. It attaches whatsmeow's session store (`whatsapp.db`) read-only and reads the `whatsmeow_lid_map` and `whatsmeow_contacts` tables directly, so contact names, phone↔LID mapping and chat de-duplication all resolve at query time without duplicating any data into `messages.db`. Two tools build on that read path:
+
+- `resolve_contact` maps a name, phone number or LID to the person's live chat JID.
+- `open_loops` surfaces conversations still waiting on a reply, collapsing the phone and LID chats for one person.
+
+It needs a recent whatsmeow build (the one pinned in `whatsapp-bridge/go.mod`) that has the lid map table, and degrades to `messages.db`-only behavior if the session store is missing. The resolution code lives in `whatsapp-mcp-server/whatsapp.py`.
+
 ## Installation
 
 ### Prerequisites
