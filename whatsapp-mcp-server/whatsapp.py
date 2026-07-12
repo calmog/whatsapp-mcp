@@ -726,21 +726,34 @@ def list_chats(
         has_session = _attach_session(conn)
         cursor = conn.cursor()
 
-        # Build base query
-        query_parts = ["""
+        # Build base query. The last-message columns come from the messages join, so
+        # only select them when include_last_message is set; otherwise emit NULLs to keep
+        # the row shape stable for the Chat constructor below (without the join, referencing
+        # messages.* raises "no such column: messages.content").
+        if include_last_message:
+            last_message_cols = """
+                messages.content as last_message,
+                messages.sender as last_sender,
+                messages.is_from_me as last_is_from_me
+            """
+        else:
+            last_message_cols = """
+                NULL as last_message,
+                NULL as last_sender,
+                NULL as last_is_from_me
+            """
+        query_parts = [f"""
             SELECT
                 chats.jid,
                 chats.name,
                 chats.last_message_time,
-                messages.content as last_message,
-                messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                {last_message_cols}
             FROM chats
         """]
-        
+
         if include_last_message:
             query_parts.append("""
-                LEFT JOIN messages ON chats.jid = messages.chat_jid 
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
                 AND chats.last_message_time = messages.timestamp
             """)
             
