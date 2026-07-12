@@ -6,3 +6,11 @@ whatsapp.log
 # Runtime artifacts — never commit
 whatsapp-bridge/store/
 whatsapp-bridge/whatsapp-bridge
+
+# Local/personal working files — keep out of the public fork
+CLAUDE.md
+memory/
+design_log.md
+fix-lid-phone-mapping.md
+start-mcp.sh
+whatsapp-mcp project Fable moonshot.md
